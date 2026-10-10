@@ -25,9 +25,10 @@ EqDisplay::EqDisplay (FormantRouletteAudioProcessor& p)
 {
     for (int b = 0; b < kNumBands; ++b)
     {
-        fP[b] = p.apvts.getParameter (FormantRouletteAudioProcessor::bandId ("f", b));
-        gP[b] = p.apvts.getParameter (FormantRouletteAudioProcessor::bandId ("g", b));
-        qP[b] = p.apvts.getParameter (FormantRouletteAudioProcessor::bandId ("q", b));
+        fP[b]    = p.apvts.getParameter (FormantRouletteAudioProcessor::bandId ("f", b));
+        gP[b]    = p.apvts.getParameter (FormantRouletteAudioProcessor::bandId ("g", b));
+        qP[b]    = p.apvts.getParameter (FormantRouletteAudioProcessor::bandId ("q", b));
+        lockP[b] = p.apvts.getParameter (FormantRouletteAudioProcessor::bandId ("l", b));
     }
     analyser.fill (-120.f);
     startTimerHz (30);
@@ -50,6 +51,33 @@ void EqDisplay::timerCallback()
         }
     }
     repaint();
+}
+
+//==============================================================================
+BandTarget EqDisplay::vals (int b) const
+{
+    if (processor.sequencerOn())
+    {
+        const int s = juce::jlimit (0, kMaxSteps - 1, processor.editStep.load());
+        return { processor.getStepValue (s, b, 0), processor.getStepValue (s, b, 1), processor.getStepValue (s, b, 2) };
+    }
+    return { fP[b]->convertFrom0to1 (fP[b]->getValue()),
+             gP[b]->convertFrom0to1 (gP[b]->getValue()),
+             qP[b]->convertFrom0to1 (qP[b]->getValue()) };
+}
+
+void EqDisplay::setVal (int b, int k, float v)
+{
+    if (processor.sequencerOn())
+    {
+        static const float lo[] = { 20.f, -24.f, 0.3f };
+        static const float hi[] = { 20000.f, 24.f, 20.f };
+        const int s = juce::jlimit (0, kMaxSteps - 1, processor.editStep.load());
+        processor.setStepValue (s, b, k, juce::jlimit (lo[k], hi[k], v));
+        return;
+    }
+    juce::RangedAudioParameter* params[] = { fP[b], gP[b], qP[b] };
+    setNormalised (params[k], v);
 }
 
 //==============================================================================
@@ -85,7 +113,8 @@ float EqDisplay::yToDb (float y) const
 
 juce::Point<float> EqDisplay::nodePos (int b) const
 {
-    return { freqToX (getF (b)), dbToY (juce::jlimit (-kDbRange, kDbRange, getG (b))) };
+    const auto v = vals (b);
+    return { freqToX (v.f), dbToY (juce::jlimit (-kDbRange, kDbRange, v.g)) };
 }
 
 int EqDisplay::hitTest (juce::Point<float> pt) const
@@ -203,16 +232,26 @@ void EqDisplay::drawCurves (juce::Graphics& g, const juce::Rectangle<float>& p) 
     const double fs = processor.getSampleRate();
     if (fs <= 0.0) return;
 
+    const bool par = processor.apvts.getRawParameterValue ("topo")->load() > 0.5f;
+
     std::array<BiquadCoeffs, kNumBands> c;
-    for (int b = 0; b < kNumBands; ++b)
-        c[(size_t) b] = BiquadCoeffs::peak (fs, processor.liveFreq[(size_t) b].load(),
-                                            processor.liveQ[(size_t) b].load(),
-                                            processor.liveGain[(size_t) b].load());
+    std::array<double, kNumBands> lin;
+    for (size_t b = 0; b < (size_t) kNumBands; ++b)
+    {
+        const double f = processor.liveFreq[b].load();
+        const double q = processor.liveQ[b].load();
+        const double gdb = processor.liveGain[b].load();
+        c[b]   = par ? BiquadCoeffs::bandpass (fs, f, q) : BiquadCoeffs::peak (fs, f, q, gdb);
+        lin[b] = par ? std::pow (10.0, gdb / 20.0) * (double) kParallelTrim : 1.0;
+    }
 
     const int active = dragged >= 0 ? dragged : hovered;
     if (active >= 0)
     {
-        auto bandPath = buildCurve (p, [&] (double f) { return 20.0 * std::log10 (std::max (1.0e-6, std::abs (c[(size_t) active].response (f, fs)))); });
+        auto bandPath = buildCurve (p, [&] (double f)
+        {
+            return 20.0 * std::log10 (std::max (1.0e-6, std::abs (lin[(size_t) active] * c[(size_t) active].response (f, fs))));
+        });
         g.setColour (Palette::band[(size_t) active].withAlpha (0.22f));
         g.fillPath (closeToBaseline (bandPath, p));
     }
@@ -220,8 +259,12 @@ void EqDisplay::drawCurves (juce::Graphics& g, const juce::Rectangle<float>& p) 
     const double mix = (double) processor.apvts.getRawParameterValue ("mix")->load();
     auto total = buildCurve (p, [&] (double f)
     {
-        std::complex<double> h = 1.0;
-        for (auto& k : c) h *= k.response (f, fs);
+        std::complex<double> h = par ? 0.0 : 1.0;
+        for (size_t b = 0; b < (size_t) kNumBands; ++b)
+        {
+            const auto r = lin[b] * c[b].response (f, fs);
+            if (par) h += r; else h *= r;
+        }
         h = (1.0 - mix) + mix * h;
         return 20.0 * std::log10 (std::max (1.0e-6, std::abs (h)));
     });
@@ -250,6 +293,13 @@ void EqDisplay::drawNodes (juce::Graphics& g, const juce::Rectangle<float>& p) c
         g.fillEllipse (pos.x - r - 5.f, pos.y - r - 5.f, (r + 5.f) * 2.f, (r + 5.f) * 2.f);
         g.setColour (col);
         g.fillEllipse (pos.x - r, pos.y - r, r * 2.f, r * 2.f);
+
+        if (isLocked (b))
+        {
+            g.setColour (juce::Colours::white);
+            g.drawEllipse (pos.x - r - 3.f, pos.y - r - 3.f, (r + 3.f) * 2.f, (r + 3.f) * 2.f, 1.6f);
+        }
+
         g.setColour (Palette::panel);
         g.setFont (juce::FontOptions (10.f, juce::Font::bold));
         g.drawText (juce::String (b + 1), juce::Rectangle<float> (pos.x - r, pos.y - r, r * 2.f, r * 2.f),
@@ -258,9 +308,10 @@ void EqDisplay::drawNodes (juce::Graphics& g, const juce::Rectangle<float>& p) c
 
     if (active >= 0)
     {
-        const auto txt = "F" + juce::String (active + 1) + "   " + fmtFreq (getF (active)) + "   "
-                         + juce::String (getG (active), 1) + " dB   Q " + juce::String (getQ (active), 2);
-        juce::Rectangle<float> box (196.f, 22.f);
+        const auto v = vals (active);
+        const auto txt = "F" + juce::String (active + 1) + (isLocked (active) ? " (locked)" : "") + "   "
+                         + fmtFreq (v.f) + "   " + juce::String (v.g, 1) + " dB   Q " + juce::String (v.q, 2);
+        juce::Rectangle<float> box (250.f, 22.f);
         box.setCentre (nodePos (active).x, nodePos (active).y - 28.f);
         box = box.constrainedWithin (p.reduced (4.f));
 
@@ -292,6 +343,14 @@ void EqDisplay::paint (juce::Graphics& g)
         drawCurves (g, p);
     }
     drawNodes (g, p);
+
+    if (processor.sequencerOn())
+    {
+        g.setColour (Palette::amber);
+        g.setFont (juce::FontOptions (11.f, juce::Font::bold));
+        g.drawText ("EDITING STEP " + juce::String (processor.editStep.load() + 1),
+                    p.reduced (8.f, 6.f), juce::Justification::topLeft);
+    }
 }
 
 //==============================================================================
@@ -310,7 +369,8 @@ void EqDisplay::mouseExit (const juce::MouseEvent&)
 void EqDisplay::mouseDown (const juce::MouseEvent& e)
 {
     dragged = hitTest (e.position);
-    if (dragged >= 0)
+    dragIsParam = ! processor.sequencerOn();
+    if (dragged >= 0 && dragIsParam)
     {
         fP[dragged]->beginChangeGesture();
         gP[dragged]->beginChangeGesture();
@@ -323,32 +383,117 @@ void EqDisplay::mouseDrag (const juce::MouseEvent& e)
     const auto p = plot();
     const float x = juce::jlimit (p.getX(), p.getRight(), e.position.x);
     const float y = juce::jlimit (p.getY(), p.getBottom(), e.position.y);
-    setNormalised (fP[dragged], xToFreq (x));
-    setNormalised (gP[dragged], yToDb (y));
+    setVal (dragged, 0, xToFreq (x));
+    setVal (dragged, 1, yToDb (y));
 }
 
 void EqDisplay::mouseUp (const juce::MouseEvent&)
 {
     if (dragged >= 0)
     {
-        fP[dragged]->endChangeGesture();
-        gP[dragged]->endChangeGesture();
+        if (dragIsParam)
+        {
+            fP[dragged]->endChangeGesture();
+            gP[dragged]->endChangeGesture();
+        }
         dragged = -1;
     }
+}
+
+void EqDisplay::mouseDoubleClick (const juce::MouseEvent& e)
+{
+    const int h = hitTest (e.position);
+    if (h < 0) return;
+    auto* lp = lockP[h];
+    lp->beginChangeGesture();
+    lp->setValueNotifyingHost (lp->getValue() > 0.5f ? 0.f : 1.f);
+    lp->endChangeGesture();
 }
 
 void EqDisplay::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w)
 {
     const int h = hitTest (e.position);
     if (h < 0) return;
-    qP[h]->beginChangeGesture();
-    setNormalised (qP[h], getQ (h) * std::exp (w.deltaY * 2.0f));
-    qP[h]->endChangeGesture();
+    const float q = getQ (h) * std::exp (w.deltaY * 2.0f);
+
+    if (processor.sequencerOn())
+    {
+        setVal (h, 2, q);
+    }
+    else
+    {
+        qP[h]->beginChangeGesture();
+        setVal (h, 2, q);
+        qP[h]->endChangeGesture();
+    }
+}
+
+//==============================================================================
+juce::Rectangle<float> StepStrip::cell (int i) const
+{
+    const float w = (float) getWidth() / (float) kMaxSteps;
+    return juce::Rectangle<float> (w * (float) i, 0.f, w, (float) getHeight()).reduced (3.f);
+}
+
+void StepStrip::paint (juce::Graphics& g)
+{
+    const bool seq = proc.sequencerOn();
+    const int nSteps = proc.numSteps();
+    const int play = proc.playingStep.load();
+    const int edit = proc.editStep.load();
+
+    for (int i = 0; i < kMaxSteps; ++i)
+    {
+        const auto r = cell (i);
+        const bool active = i < nSteps;
+        const float a = (seq ? 1.f : 0.55f) * (active ? 1.f : 0.3f);
+
+        g.setColour (juce::Colour (0xff1c1f25).withAlpha (a));
+        g.fillRoundedRectangle (r, 5.f);
+
+        // mini picture of the stored formant set: one bar per band, x = freq, height = gain
+        const auto gr = r.reduced (6.f, 7.f);
+        for (int b = 0; b < kNumBands; ++b)
+        {
+            const float f = juce::jlimit (20.f, 20000.f, proc.getStepValue (i, b, 0));
+            const float gdb = juce::jlimit (-24.f, 24.f, proc.getStepValue (i, b, 1));
+            const float x = gr.getX() + gr.getWidth() * std::log (f / 20.f) / std::log (1000.f);
+            const float hgt = juce::jmap (gdb, -24.f, 24.f, 2.f, gr.getHeight());
+            g.setColour (Palette::band[(size_t) b].withAlpha (a));
+            g.fillRoundedRectangle (x - 1.5f, gr.getBottom() - hgt, 3.f, hgt, 1.5f);
+        }
+
+        g.setColour (juce::Colours::white.withAlpha (0.5f * a));
+        g.setFont (juce::FontOptions (10.f));
+        g.drawText (juce::String (i + 1), r.reduced (5.f, 3.f), juce::Justification::topLeft);
+
+        if (seq && active && i == play)
+        {
+            g.setColour (Palette::amber);
+            g.drawRoundedRectangle (r, 5.f, 2.f);
+        }
+        if (seq && i == edit)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.65f));
+            g.drawRoundedRectangle (r.reduced (3.f), 3.f, 1.f);
+        }
+    }
+}
+
+void StepStrip::mouseDown (const juce::MouseEvent& e)
+{
+    for (int i = 0; i < proc.numSteps(); ++i)
+        if (cell (i).contains (e.position))
+        {
+            proc.editStep.store (i);
+            repaint();
+            return;
+        }
 }
 
 //==============================================================================
 FormantRouletteAudioProcessorEditor::FormantRouletteAudioProcessorEditor (FormantRouletteAudioProcessor& p)
-    : AudioProcessorEditor (&p), proc (p), display (p)
+    : AudioProcessorEditor (&p), proc (p), display (p), stepStrip (p)
 {
     setLookAndFeel (&lnf);
 
@@ -363,35 +508,71 @@ FormantRouletteAudioProcessorEditor::FormantRouletteAudioProcessorEditor (Forman
         k.label.setText (names[i], juce::dontSendNotification);
         k.label.setJustificationType (juce::Justification::centred);
         k.label.setFont (juce::FontOptions (11.f, juce::Font::bold));
-        k.att = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, ids[i], k.slider);
+        k.att = std::make_unique<APVTS::SliderAttachment> (proc.apvts, ids[i], k.slider);
         addAndMakeVisible (k.slider);
         addAndMakeVisible (k.label);
     }
 
     modeBox.addItemList ({ "Vowel", "Wild" }, 1);
     autoBox.addItemList ({ "Off", "1 beat", "2 beats", "1 bar", "2 bars" }, 1);
-    modeAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "mode", modeBox);
-    autoAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "auto", autoBox);
+    topoBox.addItemList ({ "Serial Peaks", "Parallel Bands" }, 1);
+    rateBox.addItemList ({ "1/16", "1/8", "1/4", "1/2", "1 bar" }, 1);
+    stepsBox.addItemList ({ "2 steps", "3 steps", "4 steps", "5 steps", "6 steps", "7 steps", "8 steps" }, 1);
+    modeAtt  = std::make_unique<APVTS::ComboBoxAttachment> (proc.apvts, "mode", modeBox);
+    autoAtt  = std::make_unique<APVTS::ComboBoxAttachment> (proc.apvts, "auto", autoBox);
+    topoAtt  = std::make_unique<APVTS::ComboBoxAttachment> (proc.apvts, "topo", topoBox);
+    rateAtt  = std::make_unique<APVTS::ComboBoxAttachment> (proc.apvts, "seqrate", rateBox);
+    stepsAtt = std::make_unique<APVTS::ComboBoxAttachment> (proc.apvts, "seqsteps", stepsBox);
 
     modeLabel.setText ("MODE", juce::dontSendNotification);
     autoLabel.setText ("AUTO", juce::dontSendNotification);
-    for (auto* l : { &modeLabel, &autoLabel })
+    topoLabel.setText ("FILTER", juce::dontSendNotification);
+    lockLabel.setText ("LOCK  (or double-click a node)", juce::dontSendNotification);
+    for (auto* l : { &modeLabel, &autoLabel, &topoLabel })
     {
         l->setFont (juce::FontOptions (11.f, juce::Font::bold));
         l->setJustificationType (juce::Justification::centredRight);
         addAndMakeVisible (l);
     }
+    lockLabel.setFont (juce::FontOptions (11.f, juce::Font::bold));
+    lockLabel.setJustificationType (juce::Justification::centredLeft);
+    addAndMakeVisible (lockLabel);
 
-    randomBtn.onClick = [this] { proc.randomise(); };
+    seqBtn.setButtonText ("SEQ");
+    seqBtn.setColour (juce::ToggleButton::tickColourId, Palette::amber);
+    seqAtt = std::make_unique<APVTS::ButtonAttachment> (proc.apvts, "seq", seqBtn);
+    addAndMakeVisible (seqBtn);
 
-    addAndMakeVisible (modeBox);
-    addAndMakeVisible (autoBox);
-    addAndMakeVisible (randomBtn);
-    addAndMakeVisible (display);
+    for (size_t i = 0; i < lockBtns.size(); ++i)
+    {
+        lockBtns[i].setButtonText (juce::String ((int) i + 1));
+        lockBtns[i].setColour (juce::ToggleButton::tickColourId, Palette::band[i]);
+        lockAtt[i] = std::make_unique<APVTS::ButtonAttachment> (proc.apvts,
+                        FormantRouletteAudioProcessor::bandId ("l", (int) i), lockBtns[i]);
+        addAndMakeVisible (lockBtns[i]);
+    }
+
+    randAllBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2e323b));
+    randAllBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+
+    randomBtn.onClick  = [this] { proc.randomise(); };
+    randAllBtn.onClick = [this] { proc.randomiseAllSteps(); };
+
+    for (auto* c : std::initializer_list<juce::Component*> { &modeBox, &autoBox, &topoBox, &rateBox, &stepsBox,
+                                                              &randomBtn, &randAllBtn, &display, &stepStrip })
+        addAndMakeVisible (c);
 
     setResizable (true, true);
-    setResizeLimits (720, 460, 1600, 1000);
-    setSize (920, 580);
+    setResizeLimits (900, 580, 1600, 1100);
+    setSize (980, 700);
+    startTimerHz (10);
+}
+
+void FormantRouletteAudioProcessorEditor::timerCallback()
+{
+    const juce::String t = proc.sequencerOn() ? "RANDOMISE STEP" : "RANDOMISE";
+    if (randomBtn.getButtonText() != t)
+        randomBtn.setButtonText (t);
 }
 
 void FormantRouletteAudioProcessorEditor::paint (juce::Graphics& g)
@@ -412,15 +593,20 @@ void FormantRouletteAudioProcessorEditor::resized()
 {
     auto r = getLocalBounds();
 
+    // top bar (right to left)
     auto top = r.removeFromTop (56).reduced (16, 12);
-    randomBtn.setBounds (top.removeFromRight (150));
-    top.removeFromRight (14);
-    autoBox.setBounds (top.removeFromRight (110));
-    autoLabel.setBounds (top.removeFromRight (44));
-    top.removeFromRight (10);
-    modeBox.setBounds (top.removeFromRight (100));
-    modeLabel.setBounds (top.removeFromRight (48));
+    randomBtn.setBounds (top.removeFromRight (140));
+    top.removeFromRight (12);
+    autoBox.setBounds (top.removeFromRight (92));
+    autoLabel.setBounds (top.removeFromRight (40));
+    top.removeFromRight (8);
+    modeBox.setBounds (top.removeFromRight (84));
+    modeLabel.setBounds (top.removeFromRight (44));
+    top.removeFromRight (8);
+    topoBox.setBounds (top.removeFromRight (130));
+    topoLabel.setBounds (top.removeFromRight (48));
 
+    // knobs
     auto bottom = r.removeFromBottom (128).reduced (24, 6);
     const int w = bottom.getWidth() / (int) knobs.size();
     for (auto& k : knobs)
@@ -429,6 +615,30 @@ void FormantRouletteAudioProcessorEditor::resized()
         k.label.setBounds (cell.removeFromTop (16));
         k.slider.setBounds (cell);
     }
+
+    // lock buttons + sequencer row
+    auto seqRow = r.removeFromBottom (92).reduced (14, 8);
+
+    auto lockBlock = seqRow.removeFromLeft (200);
+    lockLabel.setBounds (lockBlock.removeFromTop (18));
+    lockBlock.removeFromTop (6);
+    auto lockRow = lockBlock.removeFromTop (34);
+    for (auto& b : lockBtns)
+        b.setBounds (lockRow.removeFromLeft (36).reduced (2));
+
+    seqRow.removeFromLeft (14);
+    auto ctrl = seqRow.removeFromLeft (236);
+    auto row1 = ctrl.removeFromTop (32);
+    seqBtn.setBounds (row1.removeFromLeft (56));
+    row1.removeFromLeft (8);
+    rateBox.setBounds (row1.removeFromLeft (80));
+    row1.removeFromLeft (8);
+    stepsBox.setBounds (row1);
+    ctrl.removeFromTop (10);
+    randAllBtn.setBounds (ctrl.removeFromTop (32));
+
+    seqRow.removeFromLeft (14);
+    stepStrip.setBounds (seqRow);
 
     display.setBounds (r.reduced (14, 0));
 }
